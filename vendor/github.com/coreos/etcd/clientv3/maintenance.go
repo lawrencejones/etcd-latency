@@ -15,12 +15,11 @@
 package clientv3
 
 import (
-	"context"
 	"io"
 
 	pb "github.com/coreos/etcd/etcdserver/etcdserverpb"
 
-	"google.golang.org/grpc"
+	"golang.org/x/net/context"
 )
 
 type (
@@ -28,8 +27,6 @@ type (
 	AlarmResponse      pb.AlarmResponse
 	AlarmMember        pb.AlarmMember
 	StatusResponse     pb.StatusResponse
-	HashKVResponse     pb.HashKVResponse
-	MoveLeaderResponse pb.MoveLeaderResponse
 )
 
 type Maintenance interface {
@@ -51,27 +48,17 @@ type Maintenance interface {
 	// Status gets the status of the endpoint.
 	Status(ctx context.Context, endpoint string) (*StatusResponse, error)
 
-	// HashKV returns a hash of the KV state at the time of the RPC.
-	// If revision is zero, the hash is computed on all keys. If the revision
-	// is non-zero, the hash is computed on all keys at or below the given revision.
-	HashKV(ctx context.Context, endpoint string, rev int64) (*HashKVResponse, error)
-
 	// Snapshot provides a reader for a point-in-time snapshot of etcd.
 	Snapshot(ctx context.Context) (io.ReadCloser, error)
-
-	// MoveLeader requests current leader to transfer its leadership to the transferee.
-	// Request must be made to the leader.
-	MoveLeader(ctx context.Context, transfereeID uint64) (*MoveLeaderResponse, error)
 }
 
 type maintenance struct {
-	dial     func(endpoint string) (pb.MaintenanceClient, func(), error)
-	remote   pb.MaintenanceClient
-	callOpts []grpc.CallOption
+	dial   func(endpoint string) (pb.MaintenanceClient, func(), error)
+	remote pb.MaintenanceClient
 }
 
 func NewMaintenance(c *Client) Maintenance {
-	api := &maintenance{
+	return &maintenance{
 		dial: func(endpoint string) (pb.MaintenanceClient, func(), error) {
 			conn, err := c.dial(endpoint)
 			if err != nil {
@@ -82,23 +69,15 @@ func NewMaintenance(c *Client) Maintenance {
 		},
 		remote: RetryMaintenanceClient(c, c.conn),
 	}
-	if c != nil {
-		api.callOpts = c.callOpts
-	}
-	return api
 }
 
-func NewMaintenanceFromMaintenanceClient(remote pb.MaintenanceClient, c *Client) Maintenance {
-	api := &maintenance{
+func NewMaintenanceFromMaintenanceClient(remote pb.MaintenanceClient) Maintenance {
+	return &maintenance{
 		dial: func(string) (pb.MaintenanceClient, func(), error) {
 			return remote, func() {}, nil
 		},
 		remote: remote,
 	}
-	if c != nil {
-		api.callOpts = c.callOpts
-	}
-	return api
 }
 
 func (m *maintenance) AlarmList(ctx context.Context) (*AlarmResponse, error) {
@@ -107,7 +86,7 @@ func (m *maintenance) AlarmList(ctx context.Context) (*AlarmResponse, error) {
 		MemberID: 0,                 // all
 		Alarm:    pb.AlarmType_NONE, // all
 	}
-	resp, err := m.remote.Alarm(ctx, req, m.callOpts...)
+	resp, err := m.remote.Alarm(ctx, req)
 	if err == nil {
 		return (*AlarmResponse)(resp), nil
 	}
@@ -137,7 +116,7 @@ func (m *maintenance) AlarmDisarm(ctx context.Context, am *AlarmMember) (*AlarmR
 		return &ret, nil
 	}
 
-	resp, err := m.remote.Alarm(ctx, req, m.callOpts...)
+	resp, err := m.remote.Alarm(ctx, req)
 	if err == nil {
 		return (*AlarmResponse)(resp), nil
 	}
@@ -150,7 +129,7 @@ func (m *maintenance) Defragment(ctx context.Context, endpoint string) (*Defragm
 		return nil, toErr(ctx, err)
 	}
 	defer cancel()
-	resp, err := remote.Defragment(ctx, &pb.DefragmentRequest{}, m.callOpts...)
+	resp, err := remote.Defragment(ctx, &pb.DefragmentRequest{})
 	if err != nil {
 		return nil, toErr(ctx, err)
 	}
@@ -163,28 +142,15 @@ func (m *maintenance) Status(ctx context.Context, endpoint string) (*StatusRespo
 		return nil, toErr(ctx, err)
 	}
 	defer cancel()
-	resp, err := remote.Status(ctx, &pb.StatusRequest{}, m.callOpts...)
+	resp, err := remote.Status(ctx, &pb.StatusRequest{})
 	if err != nil {
 		return nil, toErr(ctx, err)
 	}
 	return (*StatusResponse)(resp), nil
 }
 
-func (m *maintenance) HashKV(ctx context.Context, endpoint string, rev int64) (*HashKVResponse, error) {
-	remote, cancel, err := m.dial(endpoint)
-	if err != nil {
-		return nil, toErr(ctx, err)
-	}
-	defer cancel()
-	resp, err := remote.HashKV(ctx, &pb.HashKVRequest{Revision: rev}, m.callOpts...)
-	if err != nil {
-		return nil, toErr(ctx, err)
-	}
-	return (*HashKVResponse)(resp), nil
-}
-
 func (m *maintenance) Snapshot(ctx context.Context) (io.ReadCloser, error) {
-	ss, err := m.remote.Snapshot(ctx, &pb.SnapshotRequest{}, m.callOpts...)
+	ss, err := m.remote.Snapshot(ctx, &pb.SnapshotRequest{})
 	if err != nil {
 		return nil, toErr(ctx, err)
 	}
@@ -207,20 +173,5 @@ func (m *maintenance) Snapshot(ctx context.Context) (io.ReadCloser, error) {
 		}
 		pw.Close()
 	}()
-	return &snapshotReadCloser{ctx: ctx, ReadCloser: pr}, nil
-}
-
-type snapshotReadCloser struct {
-	ctx context.Context
-	io.ReadCloser
-}
-
-func (rc *snapshotReadCloser) Read(p []byte) (n int, err error) {
-	n, err = rc.ReadCloser.Read(p)
-	return n, toErr(rc.ctx, err)
-}
-
-func (m *maintenance) MoveLeader(ctx context.Context, transfereeID uint64) (*MoveLeaderResponse, error) {
-	resp, err := m.remote.MoveLeader(ctx, &pb.MoveLeaderRequest{TargetID: transfereeID}, m.callOpts...)
-	return (*MoveLeaderResponse)(resp), toErr(ctx, err)
+	return pr, nil
 }

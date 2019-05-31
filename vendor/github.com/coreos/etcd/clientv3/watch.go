@@ -15,7 +15,6 @@
 package clientv3
 
 import (
-	"context"
 	"fmt"
 	"sync"
 	"time"
@@ -24,6 +23,7 @@ import (
 	pb "github.com/coreos/etcd/etcdserver/etcdserverpb"
 	mvccpb "github.com/coreos/etcd/mvcc/mvccpb"
 
+	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
@@ -106,8 +106,7 @@ func (wr *WatchResponse) IsProgressNotify() bool {
 
 // watcher implements the Watcher interface
 type watcher struct {
-	remote   pb.WatchClient
-	callOpts []grpc.CallOption
+	remote pb.WatchClient
 
 	// mu protects the grpc streams map
 	mu sync.RWMutex
@@ -118,9 +117,8 @@ type watcher struct {
 
 // watchGrpcStream tracks all watch resources attached to a single grpc stream.
 type watchGrpcStream struct {
-	owner    *watcher
-	remote   pb.WatchClient
-	callOpts []grpc.CallOption
+	owner  *watcher
+	remote pb.WatchClient
 
 	// ctx controls internal remote.Watch requests
 	ctx context.Context
@@ -191,18 +189,14 @@ type watcherStream struct {
 }
 
 func NewWatcher(c *Client) Watcher {
-	return NewWatchFromWatchClient(pb.NewWatchClient(c.conn), c)
+	return NewWatchFromWatchClient(pb.NewWatchClient(c.conn))
 }
 
-func NewWatchFromWatchClient(wc pb.WatchClient, c *Client) Watcher {
-	w := &watcher{
+func NewWatchFromWatchClient(wc pb.WatchClient) Watcher {
+	return &watcher{
 		remote:  wc,
 		streams: make(map[string]*watchGrpcStream),
 	}
-	if c != nil {
-		w.callOpts = c.callOpts
-	}
-	return w
 }
 
 // never closes
@@ -221,7 +215,6 @@ func (w *watcher) newWatcherGrpcStream(inctx context.Context) *watchGrpcStream {
 	wgs := &watchGrpcStream{
 		owner:      w,
 		remote:     w.remote,
-		callOpts:   w.callOpts,
 		ctx:        ctx,
 		ctxKey:     streamKeyFromCtx(inctx),
 		cancel:     cancel,
@@ -470,7 +463,7 @@ func (w *watchGrpcStream) run() {
 				if ws := w.nextResume(); ws != nil {
 					wc.Send(ws.initReq.toPB())
 				}
-			case pbresp.Canceled && pbresp.CompactRevision == 0:
+			case pbresp.Canceled:
 				delete(cancelSet, pbresp.WatchId)
 				if ws, ok := w.substreams[pbresp.WatchId]; ok {
 					// signal to stream goroutine to update closingc
@@ -769,13 +762,10 @@ func (w *watchGrpcStream) joinSubstreams() {
 	}
 }
 
-var maxBackoff = 100 * time.Millisecond
-
 // openWatchClient retries opening a watch client until success or halt.
 // manually retry in case "ws==nil && err==nil"
 // TODO: remove FailFast=false
 func (w *watchGrpcStream) openWatchClient() (ws pb.Watch_WatchClient, err error) {
-	backoff := time.Millisecond
 	for {
 		select {
 		case <-w.ctx.Done():
@@ -785,22 +775,11 @@ func (w *watchGrpcStream) openWatchClient() (ws pb.Watch_WatchClient, err error)
 			return nil, err
 		default:
 		}
-		if ws, err = w.remote.Watch(w.ctx, w.callOpts...); ws != nil && err == nil {
+		if ws, err = w.remote.Watch(w.ctx, grpc.FailFast(false)); ws != nil && err == nil {
 			break
 		}
 		if isHaltErr(w.ctx, err) {
 			return nil, v3rpc.Error(err)
-		}
-		if isUnavailableErr(w.ctx, err) {
-			// retry, but backoff
-			if backoff < maxBackoff {
-				// 25% backoff factor
-				backoff = backoff + backoff/4
-				if backoff > maxBackoff {
-					backoff = maxBackoff
-				}
-			}
-			time.Sleep(backoff)
 		}
 	}
 	return ws, nil
