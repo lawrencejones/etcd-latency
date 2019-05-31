@@ -28,6 +28,7 @@ var logger kitlog.Logger
 var (
 	app                = kingpin.New("etcd-latency", "").Version("0.0.1")
 	grpcDebugLogs      = app.Flag("grpc-debug-logs", "enables grpc debug logging").Bool()
+	syncEndpoints      = app.Flag("sync-endpoints", "attempts to sync endpoints with etcd cluster").Bool()
 	sleep              = app.Flag("sleep", "sleep for this long after opening connection").Default("0s").Duration()
 	count              = app.Flag("count", "number of benchmark runs").Default("100").Int()
 	endpoints          = app.Flag("endpoints", "comma separated etcd endpoint list").Default("127.0.0.1:2379").Envar(`ETCDCTL_ENDPOINTS`).String()
@@ -119,15 +120,33 @@ func main() {
 		kingpin.Fatalf("failed to connect to etcd: %s", err)
 	}
 
-	if err := client.Sync(ctx); err != nil {
-		kingpin.Fatalf("failed to sync endpoints: %s", err)
+	if *syncEndpoints {
+		if err := client.Sync(ctx); err != nil {
+			kingpin.Fatalf("failed to sync endpoints: %s", err)
+		}
 	}
 
 	logger.Log("endpoints", strings.Join(client.Endpoints(), ","))
 
 	if *sleep > 0 {
+		ctx, cancel := context.WithCancel(ctx)
+		go func(ctx context.Context) {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(100 * time.Millisecond):
+					if _, err := client.Get(ctx, "nothing"); err != nil {
+						logger.Log("error", err, "msg", "sleeping health check failed")
+					}
+				}
+			}
+		}(ctx)
+
 		logger.Log("event", "sleeping", "duration", sleep.Seconds())
 		time.Sleep(*sleep)
+
+		cancel()
 	}
 
 	spew.Dump(
