@@ -29,8 +29,6 @@ var (
 	app                = kingpin.New("etcd-latency", "").Version("0.0.1")
 	grpcDebugLogs      = app.Flag("grpc-debug-logs", "enables grpc debug logging").Bool()
 	syncEndpoints      = app.Flag("sync-endpoints", "attempts to sync endpoints with etcd cluster").Bool()
-	sleep              = app.Flag("sleep", "sleep for this long after opening connection").Default("0s").Duration()
-	count              = app.Flag("count", "number of benchmark runs").Default("100").Int()
 	endpoints          = app.Flag("endpoints", "comma separated etcd endpoint list").Default("127.0.0.1:2379").Envar(`ETCDCTL_ENDPOINTS`).String()
 	dialTimeout        = app.Flag("dial-timeout", "dial timeout for client connections").Default("5s").Envar(`ETCDCTL_DIAL_TIMEOUT`).Duration()
 	keepaliveTime      = app.Flag("keepalive-time", "keepalive time for client connections").Default("2s").Envar(`ETCDCTL_KEEPALIVE_TIME`).Duration()
@@ -40,6 +38,16 @@ var (
 	certFile           = app.Flag("cert", "identify secure client using this TLS certificate file").Envar(`ETCDCTL_CERT`).String()
 	keyFile            = app.Flag("key", "identify secure client using this TLS key file").Envar(`ETCDCTL_KEY`).String()
 	cacertFile         = app.Flag("cacert", "verify certificates of TLS-enabled secure servers using this CA bundle").Envar(`ETCDCTL_CACERT`).String()
+
+	pause                    = app.Command("pause", "pause while connected to cluster running health checks")
+	pauseHealthCheckInterval = pause.Flag("health-check-interval", "sleep this long between health checks").Default("500ms").Duration()
+	pauseHealthCheckTimeout  = pause.Flag("health-check-timeout", "timeout health checks after this long").Default("3s").Duration()
+
+	moveLeader           = app.Command("move-leader", "move leader from one etcd member to another")
+	moveLeaderTransferee = moveLeader.Arg("transferee", "target leader").String()
+
+	benchmark      = app.Command("benchmark", "run various benchmarks against etcd")
+	benchmarkCount = benchmark.Flag("count", "number of benchmark runs").Default("100").Int()
 )
 
 type kitlogWriter struct{ kitlog.Logger }
@@ -49,7 +57,7 @@ func (l kitlogWriter) Write(p []byte) (int, error) {
 }
 
 func main() {
-	kingpin.MustParse(app.Parse(os.Args[1:]))
+	cmd := kingpin.MustParse(app.Parse(os.Args[1:]))
 
 	logger = kitlog.NewLogfmtLogger(kitlog.NewSyncWriter(os.Stderr))
 	logger = kitlog.With(logger, "ts", kitlog.DefaultTimestampUTC)
@@ -128,39 +136,63 @@ func main() {
 
 	logger.Log("endpoints", strings.Join(client.Endpoints(), ","))
 
-	if *sleep > 0 {
-		ctx, cancel := context.WithCancel(ctx)
-		go func(ctx context.Context) {
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-time.After(100 * time.Millisecond):
-					if _, err := client.Get(ctx, "nothing"); err != nil {
-						logger.Log("error", err, "msg", "sleeping health check failed")
-					}
-				}
+	switch cmd {
+	case pause.FullCommand():
+		logger.Log("event", "pause_begin", "msg", "pausing until receive signal")
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(*pauseHealthCheckInterval):
+				func() {
+					ctx, cancel := context.WithTimeout(ctx, *pauseHealthCheckTimeout)
+					defer cancel()
+
+					var start = time.Now()
+					_, err := client.Get(ctx, "nothing")
+					logger.Log("event", "health_check", "duration", time.Since(start).Seconds(), "error", err)
+				}()
 			}
-		}(ctx)
+		}
+	case moveLeader.FullCommand():
+		resp, err := client.MemberList(ctx)
+		if err != nil {
+			kingpin.Fatalf("failed to list members: %v", err)
+		}
 
-		logger.Log("event", "sleeping", "duration", sleep.Seconds())
-		time.Sleep(*sleep)
+		var transfereeID uint64
+		for _, member := range resp.Members {
+			if member.GetName() == *moveLeaderTransferee {
+				transfereeID = member.GetID()
+			}
+		}
 
-		cancel()
+		if transfereeID == 0 {
+			kingpin.Fatalf("failed to find transferee '%s'", *moveLeaderTransferee)
+		}
+
+		transferResp, err := client.MoveLeader(ctx, transfereeID)
+		if err != nil {
+			kingpin.Fatalf("failed to move leader: %v", err)
+		}
+
+		spew.Dump(transferResp)
+
+	case benchmark.FullCommand():
+		spew.Dump(
+			runBenchmarks(ctx, *benchmarkCount, map[string]func(context.Context) error{
+				"linearisable get for missing key": func(ctx context.Context) error {
+					_, err := client.Get(ctx, "nothing")
+					return err
+				},
+				"serializable get for missing key": func(ctx context.Context) error {
+					_, err := client.Get(ctx, "nothing", clientv3.WithSerializable())
+					return err
+				},
+			}),
+		)
 	}
-
-	spew.Dump(
-		runBenchmarks(ctx, *count, map[string]func(context.Context) error{
-			"linearisable get for missing key": func(ctx context.Context) error {
-				_, err := client.Get(ctx, "nothing")
-				return err
-			},
-			"serializable get for missing key": func(ctx context.Context) error {
-				_, err := client.Get(ctx, "nothing", clientv3.WithSerializable())
-				return err
-			},
-		}),
-	)
 }
 
 func runBenchmarks(ctx context.Context, count int, ops map[string]func(context.Context) error) map[string]interface{} {

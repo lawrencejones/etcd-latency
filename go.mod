@@ -1,4 +1,4 @@
-module github.com/lawrencejones/rebuild-index-concurrently
+module github.com/lawrencejones/etcd-latency
 
 go 1.12
 
@@ -19,5 +19,5 @@ require (
 	github.com/pkg/errors v0.8.1 // indirect
 	golang.org/x/crypto v0.0.0-20190513172903-22d7a77e9e5f // indirect
 	golang.org/x/text v0.3.2 // indirect
-	google.golang.org/grpc v1.20.1 // indirect
+	google.golang.org/grpc v1.20.1
 )
