@@ -40,6 +40,7 @@ var (
 	cacertFile         = app.Flag("cacert", "verify certificates of TLS-enabled secure servers using this CA bundle").Envar(`ETCDCTL_CACERT`).String()
 
 	pause                    = app.Command("pause", "pause while connected to cluster running health checks")
+	pausePanic               = pause.Flag("panic", "panic when a health check fails").Bool()
 	pauseHealthCheckInterval = pause.Flag("health-check-interval", "sleep this long between health checks").Default("500ms").Duration()
 	pauseHealthCheckTimeout  = pause.Flag("health-check-timeout", "timeout health checks after this long").Default("3s").Duration()
 
@@ -66,7 +67,7 @@ func main() {
 	if *grpcDebugLogs {
 		var out = kitlogWriter{logger}
 		clientv3.SetLogger(
-			grpclog.NewLoggerV2WithVerbosity(out, out, out, 0),
+			grpclog.NewLoggerV2WithVerbosity(out, out, out, 7),
 		)
 	}
 
@@ -152,6 +153,10 @@ func main() {
 					var start = time.Now()
 					_, err := client.Get(ctx, "nothing")
 					logger.Log("event", "health_check", "duration", time.Since(start).Seconds(), "error", err)
+
+					if *pausePanic && err != nil {
+						panic(err)
+					}
 				}()
 			}
 		}
